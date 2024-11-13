@@ -15,39 +15,30 @@ use sqlx::{postgres::PgPoolOptions, Row};
 use std::env;
 use std::io::Result;
 
-#[get("/")]
-async fn home_page() -> impl Responder {
-    let database_url = "postgres://alex:password@localhost/test";
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(database_url)
-        .await
-        .expect("Failed");
-    let rows = sqlx::query("SELECT id, name, email FROM test_table")
-        .fetch_all(&pool)
-        .await;
-    match rows {
-        Ok(rows) => {
-            let mut all_rows = String::new();
-            for row in rows {
-                all_rows.push_str(&format!(
-                    "ID: {}, Name: {}, Email: {}",
-                    row.get::<i32, _>("id"),
-                    row.get::<Option<String>, _>("name")
-                        .unwrap_or("unknown".to_string()),
-                    row.get::<Option<String>, _>("email")
-                        .unwrap_or("unknown".to_string()),
-                ));
+#[post("/")]
+async fn home_page(data: web::Json<String>, pool: web::Data<PgPool>) -> impl Responder {
+    let table = data.into_inner();
+    let exists = does_table_exist(&pool, &table).await;
+    if exists {
+        return HttpResponse::Ok().body("success");
+    } else {
+        //WE HAVE table questions_test (id SERIAL PRIMARY KEY, question VARCHAR(255), votes INT DEFAULT 0);
+        let query = format!(
+            "
+            CREATE TABLE {} (id SERIAL PRIMARY KEY, question VARCHAR(255), votes INT DEFAULT 0)",
+            table
+        );
+        let result = sqlx::query(&query).execute(pool.as_ref()).await;
+        match result {
+            Ok(_) => {
+                return HttpResponse::Ok().body("success");
             }
-            HttpResponse::Ok().body(all_rows)
+            Err(e) => HttpResponse::InternalServerError().body(format!("{}", e)),
         }
-        Err(e) => HttpResponse::Ok().body(format!("error reading database: {}", e)),
     }
 }
-#[get("/{path}")]
-async fn dynamic_get(path: web::Path<String>, pool: web::Data<PgPool>) -> impl Responder {
-    // check if table exists for this website or not. And if not, return error.
-    let path = path.to_string();
+
+async fn does_table_exist(pool: &PgPool, path: &str) -> bool {
     let query = "
         SELECT EXISTS (
             SELECT 1
@@ -56,12 +47,17 @@ async fn dynamic_get(path: web::Path<String>, pool: web::Data<PgPool>) -> impl R
             AND TABLE_NAME = $1
         );
     ";
-    let row = sqlx::query(query)
-        .bind(path.clone())
-        .fetch_one(pool.as_ref())
-        .await;
+    let row = sqlx::query(query).bind(path).fetch_one(pool).await;
     let rowresult = row.expect("error unwrapping row in dynamic get address.");
     let exists: bool = rowresult.get(0);
+    return exists;
+}
+
+#[get("/{path}")]
+async fn dynamic_get(path: web::Path<String>, pool: web::Data<PgPool>) -> impl Responder {
+    // check if table exists for this website or not. And if not, return error.
+    let path = path.to_string();
+    let exists = does_table_exist(&pool, &path).await;
 
     if exists {
         //passing &path to create questions list bc the path is the table name.
@@ -86,7 +82,7 @@ struct QuestionPayload {
     question_id: Option<i32>, //id of the question (used with voting)
     vote_type: Option<String>, //upvote, downvote
 }
-#[post("/alex")]
+#[post("{path}")]
 async fn alex_post(
     payload: web::Json<QuestionPayload>,
     pool: web::Data<PgPool>,
@@ -106,9 +102,8 @@ async fn alex_post(
         "create" => {
             //for creating a new question
             let question = payload.question.clone().unwrap();
-            let query = "INSERT INTO $1 (question) VALUES ($2)"; // Use direct string for the query
-            match sqlx::query(query)
-                .bind(path.clone())
+            let query = format!("INSERT INTO {} (question) VALUES ($1)", path); // Use direct string for the query
+            match sqlx::query(&query)
                 .bind(&question) // Bind the question variable
                 .execute(pool.as_ref()) // get the refrenece
                 .await
@@ -129,37 +124,27 @@ async fn alex_post(
             );
 
             let query = if vote_type == "upvote" {
-                "UPDATE $1 SET votes = votes + 1 WHERE id = $2"
+                format!("UPDATE {} SET votes = votes + 1 WHERE id = $1", path)
             } else if vote_type == "downvote" {
                 //This will be a little different. Check if votecount is
                 //already -2. if so, as -3 is deletion, this will call a
                 //removal.
                 //if not, it will simply return an update
-                let rowresult = sqlx::query("SELECT votes FROM $1 WHERE id = $2")
-                    .bind(path.clone())
+                let rowresult = sqlx::query(&format!("SELECT votes FROM {} WHERE id = $1", path))
                     .bind(qid)
                     .fetch_one(pool.as_ref())
                     .await;
                 let row = rowresult.expect("error unwrapping row"); //should never have any issues
                 let votes = row.get::<i32, _>("votes");
                 if votes == -2 {
-                    let _ = sqlx::query("DELETE FROM $1 WHERE id = $2")
-                        .bind(path.clone())
-                        .bind(qid)
-                        .execute(pool.as_ref())
-                        .await;
-                    return HttpResponse::Ok().body("Post deleted"); //will kill the post
+                    format!("DELETE FROM {} WHERE id = $1", path)
                 } else {
-                    "UPDATE $1 SET votes = votes - 1 WHERE id = $2"
+                    format!("UPDATE {} SET votes = votes - 1 WHERE id = $1", path)
                 }
             } else {
-                return HttpResponse::InternalServerError().body("error with voting");
+                "null".to_string()
             };
-            let _ = sqlx::query(query)
-                .bind(path)
-                .bind(qid)
-                .execute(pool.as_ref())
-                .await;
+            let _ = sqlx::query(&query).bind(qid).execute(pool.as_ref()).await;
             //dont really have any use for this but will expand error handling here if necessary
             HttpResponse::Ok().body("vote recieved")
         }
