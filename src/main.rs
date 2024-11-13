@@ -45,9 +45,36 @@ async fn home_page() -> impl Responder {
     }
 }
 #[get("/{path}")]
-async fn dynamic_get(path: web::Path<String>) -> impl Responder {
+async fn dynamic_get(path: web::Path<String>, pool: web::Data<PgPool>) -> impl Responder {
+    // check if table exists for this website or not. And if not, return error.
     let path = path.to_string();
-    path
+    let query = "
+        SELECT EXISTS (
+            SELECT 1
+            FROM INFORMATION_SCHEMA.TABLES
+            WHERE TABLE_SCHEMA = 'public'
+            AND TABLE_NAME = $1
+        );
+    ";
+    let row = sqlx::query(query)
+        .bind(path.clone())
+        .fetch_one(pool.as_ref())
+        .await;
+    let rowresult = row.expect("error unwrapping row in dynamic get address.");
+    let exists: bool = rowresult.get(0);
+
+    if exists {
+        //passing &path to create questions list bc the path is the table name.
+        let questions = create_questions_list_json(&pool, &path).await;
+        match questions {
+            Ok(q) => HttpResponse::Ok().json(q), //return the questions
+            Err(e) => {
+                HttpResponse::InternalServerError().body(format!("Error fetching questions: {}", e))
+            }
+        }
+    } else {
+        HttpResponse::InternalServerError().body(format!("ERROR! NO SITE EXISTS"))
+    }
 }
 //our get method returns the questions as json object
 //now we want our post method to recieve some information
@@ -60,7 +87,11 @@ struct QuestionPayload {
     vote_type: Option<String>, //upvote, downvote
 }
 #[post("/alex")]
-async fn alex_post(payload: web::Json<QuestionPayload>, pool: web::Data<PgPool>) -> impl Responder {
+async fn alex_post(
+    payload: web::Json<QuestionPayload>,
+    pool: web::Data<PgPool>,
+    path: web::Path<String>,
+) -> impl Responder {
     //write code to accept what is either an upvote or a question, and handle it appropriately.
     /*
      * Format of JSON will be like this
@@ -70,12 +101,14 @@ async fn alex_post(payload: web::Json<QuestionPayload>, pool: web::Data<PgPool>)
      *  { vote_type : also for voting
      *  they are all options.
      */
+    let path = path.to_string();
     match payload.action.as_str() {
         "create" => {
             //for creating a new question
             let question = payload.question.clone().unwrap();
-            let query = "INSERT INTO questions_test (question) VALUES ($1)"; // Use direct string for the query
+            let query = "INSERT INTO $1 (question) VALUES ($2)"; // Use direct string for the query
             match sqlx::query(query)
+                .bind(path.clone())
                 .bind(&question) // Bind the question variable
                 .execute(pool.as_ref()) // get the refrenece
                 .await
@@ -90,33 +123,43 @@ async fn alex_post(payload: web::Json<QuestionPayload>, pool: web::Data<PgPool>)
         "vote" => {
             let qid = payload.question_id.clone().unwrap(); //unsafe but assuming things are written fine
             let vote_type = payload.vote_type.clone().unwrap(); //unsafe; either upvote or downvote
+            println!(
+                "Received vote for question ID: {}, type: {}",
+                qid, vote_type
+            );
 
             let query = if vote_type == "upvote" {
-                "UPDATE questions_test SET votes = votes + 1 WHERE id = $1"
+                "UPDATE $1 SET votes = votes + 1 WHERE id = $2"
             } else if vote_type == "downvote" {
                 //This will be a little different. Check if votecount is
                 //already -2. if so, as -3 is deletion, this will call a
                 //removal.
                 //if not, it will simply return an update
-                let rowresult = sqlx::query("SELECT votes FROM questions_test WHERE id = $1")
+                let rowresult = sqlx::query("SELECT votes FROM $1 WHERE id = $2")
+                    .bind(path.clone())
                     .bind(qid)
                     .fetch_one(pool.as_ref())
                     .await;
                 let row = rowresult.expect("error unwrapping row"); //should never have any issues
                 let votes = row.get::<i32, _>("votes");
                 if votes == -2 {
-                    let _ = sqlx::query("DELETE FROM questions_test WHERE id = $1")
+                    let _ = sqlx::query("DELETE FROM $1 WHERE id = $2")
+                        .bind(path.clone())
                         .bind(qid)
                         .execute(pool.as_ref())
                         .await;
                     return HttpResponse::Ok().body("Post deleted"); //will kill the post
                 } else {
-                    "UPDATE questions_test SET votes = votes - 1 WHERE id = $1"
+                    "UPDATE $1 SET votes = votes - 1 WHERE id = $2"
                 }
             } else {
                 return HttpResponse::InternalServerError().body("error with voting");
             };
-            let _ = sqlx::query(query).bind(qid).execute(pool.as_ref()).await;
+            let _ = sqlx::query(query)
+                .bind(path)
+                .bind(qid)
+                .execute(pool.as_ref())
+                .await;
             //dont really have any use for this but will expand error handling here if necessary
             HttpResponse::Ok().body("vote recieved")
         }
