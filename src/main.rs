@@ -7,7 +7,8 @@
 //or any other logic that does not make sense to preform client side.
 
 use actix_cors::Cors;
-use actix_web::{get, post, web, App, HttpResponse, HttpServer, Responder};
+use actix_files::{Files, NamedFile};
+use actix_web::{get, post, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use serde::Deserialize;
 use serde::Serialize;
 use sqlx::PgPool;
@@ -15,7 +16,17 @@ use sqlx::{postgres::PgPoolOptions, Row};
 use std::env;
 use std::io::Result;
 
-#[post("/")]
+//fallback onto these for dynamic address
+async fn fallback(req: HttpRequest) -> impl Responder {
+    // Try to open index.html, which will be served if no other route matches
+    let index_path = "./build/index.html";
+    match actix_files::NamedFile::open(index_path) {
+        Ok(file) => file.into_response(&req),        // Serve index.html
+        Err(_) => HttpResponse::NotFound().finish(), // If not found, return 404
+    }
+}
+
+#[post("/api/")]
 async fn home_page(data: web::Json<String>, pool: web::Data<PgPool>) -> impl Responder {
     let table = data.into_inner();
     let exists = does_table_exist(&pool, &table).await;
@@ -53,7 +64,7 @@ async fn does_table_exist(pool: &PgPool, path: &str) -> bool {
     return exists;
 }
 
-#[get("/{path}")]
+#[get("/api/{path}")]
 async fn dynamic_get(path: web::Path<String>, pool: web::Data<PgPool>) -> impl Responder {
     // check if table exists for this website or not. And if not, return error.
     let path = path.to_string();
@@ -82,7 +93,7 @@ struct QuestionPayload {
     question_id: Option<i32>, //id of the question (used with voting)
     vote_type: Option<String>, //upvote, downvote
 }
-#[post("{path}")]
+#[post("/api/{path}")]
 async fn alex_post(
     payload: web::Json<QuestionPayload>,
     pool: web::Data<PgPool>,
@@ -152,24 +163,6 @@ async fn alex_post(
     }
 }
 
-#[get("/alex")]
-async fn alex() -> impl Responder {
-    let database_url = "postgres://alex:password@localhost/test";
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(database_url)
-        .await
-        .expect("Failed");
-    //get the questions and return them
-    let questions = create_questions_list_json(&pool, "questions_test").await;
-    match questions {
-        Ok(q) => HttpResponse::Ok().json(q),
-        Err(e) => {
-            HttpResponse::InternalServerError().body(format!("Error fetching questions: {}", e))
-        }
-    }
-}
-
 #[actix_web::main]
 async fn main() -> Result<()> {
     //make a pool that the web data will hold
@@ -190,9 +183,10 @@ async fn main() -> Result<()> {
             )
             .app_data(web::Data::new(pool.clone()))
             .service(home_page)
-            .service(alex)
             .service(alex_post)
             .service(dynamic_get)
+            .service(Files::new("/", "./build").index_file("index.html"))
+            .default_service(web::route().to(fallback))
     })
     .bind("127.0.0.1:8080")?
     .run()
